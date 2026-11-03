@@ -1,0 +1,297 @@
+desc:Presswerk-Klon - FF/FB/INT Kompressor mit Saettigung, M/S, DPR, Parallel-Mix
+// Eigenstaendige Nachbildung der im Presswerk-Handbuch beschriebenen Architektur.
+// Fuer ReaJS (ReaPlugs) in FL Studio oder direkt in REAPER.
+//
+// Signalfluss:
+// Input -> [DPR in] -> Lookahead-Delay -> (M/S enc) -> [Sat PRE] -> VCA -> [Sat POST]
+//       -> (M/S dec) -> [DPR out] -> Wet Level -> Mix mit Dry (HP / Expand) -> Output -> Soft Clip
+// Detektor: Int/Ext-Mix -> Low/High Cut -> RMS -> Link -> Gain Computer (FF/FB/INT) -> Envelope
+
+slider1:0<-24,24,0.1>Input (dB)
+slider2:0<-24,24,0.1>Output (dB)
+slider3:-18<-60,0,0.1>Threshold (dB)
+slider4:4<1,20,0.1>Ratio (x:1)
+slider5:6<0,24,0.1>Soft Knee (dB)
+slider6:0<-1,1,0.01>Non Lin
+slider7:0<0,1,1{Aus,An}>Auto Makeup
+slider8:10<0.05,200,0.01>Attack (ms)
+slider9:150<5,2000,1>Release (ms)
+slider10:0<0,100,1>Adapt (%)
+slider11:2<0,50,0.1>RMS Window (ms, 0 = Peak)
+slider12:0<0,2,1{FF - Feed Forward,FB - Feed Back,INT - Interactive}>Detection
+slider13:100<0,100,1>Channel Link (%)
+slider14:0<0,1,1{L/R,M/S}>Stereo Mode
+slider15:0<0,1,1{Aus,An}>DPR (Dual Phase Rotator)
+slider16:-100<-100,100,1>SC Int:Ext (-100 = Int, +100 = Ext)
+slider17:0<-5,5,0.01>SC Delay (ms, negativ = Look-ahead)
+slider18:20<20,2000,1>SC Low Cut (Hz)
+slider19:20000<500,20000,1>SC High Cut (Hz)
+slider20:0<0,1,1{6 dB/Okt,12 dB/Okt}>SC Filter-Steilheit
+slider21:0<0,3,1{Aus,CH1 Solo,CH2 Solo,Beide}>SC Monitor
+slider22:0<-24,24,0.1>SC Monitor Level (dB)
+slider23:0<0,1,1{Post (nach Kompression),Pre (vor Kompression)}>Saturation Position
+slider24:0<0,24,0.1>Saturation Amount (dB)
+slider25:0<0,100,1>Saturation Dynamics (%)
+slider26:0<0,12,0.1>Saturation Warmth (dB)
+slider27:100<0,100,1>Mix Dry:Wet (% Wet)
+slider28:0<-24,24,0.1>Mix Wet Level (dB)
+slider29:20<20,10000,1>Mix Dry HP (Hz)
+slider30:0<0,1,1{Aus,An}>Mix Expand
+slider31:1<0,1,1{Aus,An}>Soft Clip
+
+@init
+// ---------- Hilfsfunktionen ----------
+function th(x) local(e) ( x = max(-20, min(20, x)); e = exp(2*x); (e-1)/(e+1); );
+
+// 1-Pol Tief-/Hochpass (6 dB/Okt)
+function op_set(f) instance(a) ( a = exp(-2*$pi*min(f, 0.49*srate)/srate); );
+function lp1(x) instance(a, z) ( z = x + (z - x)*a; z; );
+function hp1(x) instance(a, z) ( z = x + (z - x)*a; x - z; );
+
+// Biquad-Allpass (fuer DPR)
+function ap_set(f, q) instance(b0, b1, a1, a2) local(w, cs, al, a0)
+(
+  w = 2*$pi*f/srate; cs = cos(w); al = sin(w)/(2*q); a0 = 1 + al;
+  b0 = (1 - al)/a0; b1 = -2*cs/a0; a1 = b1; a2 = b0;
+);
+function ap(x) instance(b0, b1, a1, a2, x1, x2, y1, y2) local(y)
+(
+  y = b0*x + b1*x1 + x2 - a1*y1 - a2*y2;
+  x2 = x1; x1 = x; y2 = y1; y1 = y;
+  y;
+);
+
+// 1. Ordnung Low-Shelf (Warmth) und seine exakte Inverse
+function sh_set(fc, g, inv) instance(b0, b1, a1) local(K, n)
+(
+  K = tan($pi*fc/srate);
+  inv ? ( n = K*g + 1; b0 = (K + 1)/n; b1 = (K - 1)/n; a1 = (K*g - 1)/n; )
+      : ( n = K + 1;   b0 = (K*g + 1)/n; b1 = (K*g - 1)/n; a1 = (K - 1)/n; );
+);
+function sh(x) instance(b0, b1, a1, x1, y1) local(y)
+( y = b0*x + b1*x1 - a1*y1; x1 = x; y1 = y; y; );
+
+// Saettiger: ungerade Obertoene (tanh), weich eingeblendet ab 0 dB Amount
+function satur(x, d) local(k)
+( k = min((d - 1)*4, 1); d > 1.0001 ? x + (th(x*d)/d - x)*k : x; );
+
+// Gain Computer: Pegel in dB -> Gain-Reduktion in dB (<= 0)
+function gc(L, T, W, s, nl) local(ov, gr, x)
+(
+  ov = L - T;
+  W < 0.01 ? (
+    gr = ov > 0 ? s*ov : 0;
+  ) : (
+    2*ov < -W ? gr = 0 :
+    2*ov >  W ? gr = s*ov :
+    ( x = ov + W*0.5; gr = s*x*x/(2*W); );
+  );
+  // Non Lin: positiv biegt die Kurve nach unten (mehr Reduktion), negativ nach oben
+  x = max(ov + W*0.5, 0);
+  gr -= nl*x*x/(48 + 2*x);
+  min(gr, 0);
+);
+
+// Soft Clip: linear bis ca. -3 dBFS, darueber weich gegen 0 dBFS
+function sclip(x) local(a, t)
+( t = 0.7; a = abs(x); a > t ? sign(x)*(t + (1 - t)*th((a - t)/(1 - t))) : x; );
+
+// ---------- Speicher / Lookahead ----------
+N = 8192;
+bufM = 0;       // Hauptsignal, 2 Kanaele
+bufS = 2*N;     // Sidechain, 4 Kanaele (Int L/R, Ext L/R)
+memset(0, 0, 6*N);
+wpos = 0;
+D = ceil(0.005*srate);      // feste 5 ms Lookahead-Reserve
+pdc_delay = D; pdc_bot_ch = 0; pdc_top_ch = 2;
+
+G1 = G2 = 0; ms1 = ms2 = 0; pk1 = pk2 = 0; cr1 = cr2 = 0; w1 = w2 = 0;
+pk_r    = exp(-1/(0.05*srate));
+crest_c = 1 - exp(-1/(0.1*srate));
+w_c     = 1 - exp(-1/(0.03*srate));
+mdec    = exp(-1/(0.3*srate));
+inpk = outpk = 0;
+
+@slider
+ingain  = 10^(slider1/20);
+outgain = 10^(slider2/20);
+thr = slider3; ratio = max(slider4, 1); knee = slider5; nonlin = slider6;
+makeup = slider7 ? -thr*(1 - 1/ratio)/6 : 0;   // halbe theoretische Kompensation (Handbuch: -20 dB, 4:1 -> 2,5 dB)
+
+// Kennlinien-Steigungen
+s_ff = 1/ratio - 1;
+se = 1/min(ratio, 2.5) - 1;  s_fb = se/(1 + se);  // FB: im Regelkreis max. ca. 2,5:1
+s_int = 1/min(ratio, 5) - 1;                       // INT: FF-Anteil max. ca. 5:1
+
+mode = slider12;
+att_c = 1 - exp(-2.3/(max(slider8, 0.01)*0.001*srate));   // 90 % nach Attack-Zeit
+mode > 0 ? att_c = min(att_c, 0.5);                        // Stabilitaet im Regelkreis
+rel_s = slider9*0.001*srate;                               // 63 % nach Release-Zeit
+adapt = slider10/100;
+rms_c = slider11 > 0.01 ? 1 - exp(-1/(slider11*0.001*srate)) : 1;
+
+link = slider13/100;
+msmode = slider14; dpr = slider15;
+ext = (slider16 + 100)/200;
+scd = D + floor(slider17*0.001*srate + 0.5); scd = max(0, min(scd, N - 1));
+
+hpA1.op_set(slider18); hpA2.op_set(slider18); hpB1.op_set(slider18); hpB2.op_set(slider18);
+lpA1.op_set(slider19); lpA2.op_set(slider19); lpB1.op_set(slider19); lpB2.op_set(slider19);
+slope12 = slider20;
+mon = slider21; monlvl = 10^(slider22/20);
+
+satpre = slider23; satamt = slider24; satdyn = slider25/100;
+wg = 10^(-slider26/20);
+shp1.sh_set(600, wg, 0); shq1.sh_set(600, wg, 1);
+shp2.sh_set(600, wg, 0); shq2.sh_set(600, wg, 1);
+
+wet = slider27/100;
+wetlvl = 10^((slider28 + makeup)/20);
+dhpL.op_set(slider29); dhpR.op_set(slider29);
+expand = slider30; sclp = slider31;
+
+apiL.ap_set(200, 0.7); apiR.ap_set(200, 0.7);   // DPR Eingang: tiefe Mitten
+apoL.ap_set(70, 0.7);  apoR.ap_set(70, 0.7);    // DPR Ausgang: Bass
+
+@sample
+// ---------- Eingang ----------
+xl = spl0*ingain; xr = spl1*ingain;
+el = spl2*ingain; er = spl3*ingain;     // externe Sidechain (Kanal 3/4)
+inpk = max(max(abs(xl), abs(xr)), inpk*mdec);
+dpr ? ( xl = apiL.ap(xl); xr = apiR.ap(xr); );
+
+bufM[wpos] = xl; bufM[N + wpos] = xr;
+bufS[wpos] = xl; bufS[N + wpos] = xr; bufS[2*N + wpos] = el; bufS[3*N + wpos] = er;
+rp = wpos - D;   rp < 0 ? rp += N;
+rs = wpos - scd; rs < 0 ? rs += N;
+dl = bufM[rp]; dr = bufM[N + rp];
+il = bufS[rs]; ir = bufS[N + rs]; xel = bufS[2*N + rs]; xer = bufS[3*N + rs];
+wpos += 1; wpos >= N ? wpos = 0;
+
+// ---------- M/S ----------
+msmode ? (
+  c1 = (dl + dr)*0.5;  c2 = (dl - dr)*0.5;
+  s1 = (il + ir)*0.5;  s2 = (il - ir)*0.5;
+  e1 = (xel + xer)*0.5; e2 = (xel - xer)*0.5;
+) : (
+  c1 = dl; c2 = dr; s1 = il; s2 = ir; e1 = xel; e2 = xer;
+);
+
+// ---------- Sidechain: Int:Ext + Filter ----------
+d1 = s1*(1 - ext) + e1*ext;
+d2 = s2*(1 - ext) + e2*ext;
+d1 = hpA1.hp1(d1); d2 = hpB1.hp1(d2);
+slope12 ? ( d1 = hpA2.hp1(d1); d2 = hpB2.hp1(d2); );
+d1 = lpA1.lp1(d1); d2 = lpB1.lp1(d2);
+slope12 ? ( d1 = lpA2.lp1(d1); d2 = lpB2.lp1(d2); );
+
+// ---------- Pegel (RMS) + Crest-Faktor ----------
+ms1 += (d1*d1 - ms1)*rms_c;  ms2 += (d2*d2 - ms2)*rms_c;
+L1 = 10*log10(ms1 + 1e-12);  L2 = 10*log10(ms2 + 1e-12);
+
+pk1 = max(abs(d1), pk1*pk_r);  pk2 = max(abs(d2), pk2*pk_r);
+cr1 += (d1*d1 - cr1)*crest_c;  cr2 += (d2*d2 - cr2)*crest_c;
+q1 = 20*log10((pk1 + 1e-9)/(sqrt(cr1) + 1e-9));
+q2 = 20*log10((pk2 + 1e-9)/(sqrt(cr2) + 1e-9));
+w1 += (min(max((q1 - 4)/10, 0), 1) - w1)*w_c;   // 0 = gleichmaessig, 1 = transientenreich
+w2 += (min(max((q2 - 4)/10, 0), 1) - w2)*w_c;
+
+// ---------- Channel Link ----------
+Lm = max(L1, L2); wm = max(w1, w2);
+Ln1 = L1 + (Lm - L1)*link;  Ln2 = L2 + (Lm - L2)*link;
+wn1 = w1 + (wm - w1)*link;  wn2 = w2 + (wm - w2)*link;
+
+// ---------- Gain Computer ----------
+mode == 0 ? (
+  T1 = gc(Ln1, thr, knee, s_ff, nonlin);
+  T2 = gc(Ln2, thr, knee, s_ff, nonlin);
+) : mode == 1 ? (
+  T1 = gc(Ln1 + G1, thr, knee, s_fb, nonlin);       // Detektor sieht den Ausgang
+  T2 = gc(Ln2 + G2, thr, knee, s_fb, nonlin);
+) : (
+  T1 = wn1*gc(Ln1, thr, knee, s_int, nonlin) + (1 - wn1)*gc(Ln1 + G1, thr, knee, s_fb, nonlin);
+  T2 = wn2*gc(Ln2, thr, knee, s_int, nonlin) + (1 - wn2)*gc(Ln2 + G2, thr, knee, s_fb, nonlin);
+);
+
+// ---------- Envelope (Attack / Release / Adapt) ----------
+T1 < G1 ? G1 += (T1 - G1)*att_c
+        : G1 += (T1 - G1)*(1 - exp(-1/(rel_s*4^(adapt*(1 - 2*wn1)))));
+T2 < G2 ? G2 += (T2 - G2)*att_c
+        : G2 += (T2 - G2)*(1 - exp(-1/(rel_s*4^(adapt*(1 - 2*wn2)))));
+g1 = exp(G1*0.1151292546);  g2 = exp(G2*0.1151292546);
+
+// ---------- Saettigung + VCA ----------
+satamt > 0 ? (
+  dv1 = exp(satamt*((1 - satdyn) + satdyn*min(-G1/6, 1))*0.1151292546);
+  dv2 = exp(satamt*((1 - satdyn) + satdyn*min(-G2/6, 1))*0.1151292546);
+  satpre ? (
+    ya = shq1.sh(satur(shp1.sh(c1), dv1))*g1;
+    yb = shq2.sh(satur(shp2.sh(c2), dv2))*g2;
+  ) : (
+    ya = shq1.sh(satur(shp1.sh(c1*g1), dv1));
+    yb = shq2.sh(satur(shp2.sh(c2*g2), dv2));
+  );
+) : (
+  ya = c1*g1; yb = c2*g2;
+);
+
+msmode ? ( wl = ya + yb; wr = ya - yb; ) : ( wl = ya; wr = yb; );
+dpr ? ( wl = apoL.ap(wl); wr = apoR.ap(wr); );
+wl *= wetlvl; wr *= wetlvl;
+
+// ---------- Dry-Weg: HP + Expand ----------
+dryl = dhpL.hp1(dl); dryr = dhpR.hp1(dr);
+expand ? (
+  msmode ? ( x1e = x2e = min(1/g1, 15.85); )
+         : ( x1e = min(1/g1, 15.85); x2e = min(1/g2, 15.85); );
+  dryl *= x1e; dryr *= x2e;      // Dry * inverse Gain-Reduktion (max. +24 dB)
+);
+
+outl = dryl*(1 - wet) + wl*wet;
+outr = dryr*(1 - wet) + wr*wet;
+
+// ---------- Sidechain-Monitor ----------
+mon == 1 ? ( outl = outr = d1*monlvl; );
+mon == 2 ? ( outl = outr = d2*monlvl; );
+mon == 3 ? (
+  msmode ? ( outl = (d1 + d2)*monlvl; outr = (d1 - d2)*monlvl; )
+         : ( outl = d1*monlvl; outr = d2*monlvl; );
+);
+
+// ---------- Ausgang ----------
+outl *= outgain; outr *= outgain;
+sclp ? ( outl = sclip(outl); outr = sclip(outr); );
+outpk = max(max(abs(outl), abs(outr)), outpk*mdec);
+spl0 = outl; spl1 = outr;
+
+@gfx 460 180
+gfx_r = gfx_g = gfx_b = 0.12; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+bw = gfx_w - 130;
+// Gain Reduction (0..24 dB)
+gfx_r = 1; gfx_g = 0.55; gfx_b = 0.1;
+gfx_rect(110, 10, bw*min(-G1/24, 1), 16);
+gfx_rect(110, 34, bw*min(-G2/24, 1), 16);
+// Pegel (-48..0 dBFS)
+gfx_r = 0.2; gfx_g = 0.9; gfx_b = 0.3;
+iv = 20*log10(inpk + 1e-9);  ov = 20*log10(outpk + 1e-9);
+gfx_rect(110, 66, bw*max(min((iv + 48)/48, 1), 0), 16);
+ov > -0.1 ? ( gfx_r = 1; gfx_g = 0.2; gfx_b = 0.2; );
+gfx_rect(110, 90, bw*max(min((ov + 48)/48, 1), 0), 16);
+
+gfx_r = gfx_g = gfx_b = 0.9;
+gfx_x = 10; gfx_y = 13; gfx_drawstr(msmode ? "GR Mid" : "GR CH1");
+gfx_x = 70; gfx_drawnumber(-G1, 1);
+gfx_x = 10; gfx_y = 37; gfx_drawstr(msmode ? "GR Side" : "GR CH2");
+gfx_x = 70; gfx_drawnumber(-G2, 1);
+gfx_x = 10; gfx_y = 69; gfx_drawstr("IN");
+gfx_x = 70; gfx_drawnumber(iv, 1);
+gfx_x = 10; gfx_y = 93; gfx_drawstr("OUT");
+gfx_x = 70; gfx_drawnumber(ov, 1);
+
+gfx_x = 10; gfx_y = 125;
+gfx_drawstr(mode == 0 ? "Detection: FF" : mode == 1 ? "Detection: FB" : "Detection: INT   FF-Anteil %: ");
+mode == 2 ? gfx_drawnumber(wn1*100, 0);
+gfx_x = 10; gfx_y = 145;
+gfx_drawstr(mon ? "SIDECHAIN MONITOR AKTIV" : "");
